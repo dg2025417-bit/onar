@@ -1,179 +1,193 @@
 import base64
 import io
+import os
+import tempfile
 from datetime import datetime
 
 import streamlit as st
+import streamlit.components.v1 as components
 from PIL import Image, ImageOps
-
-from camera_component import camera_capture
 
 st.set_page_config(page_title="포토부스", page_icon="📸", layout="centered")
 
-# --------------------------------------------------------------------------
-# Frame definitions
-# Each frame image has 4 photo "slots". Coordinates were measured directly
-# from the provided frame images (pixel boxes: x0, y0, x1, y1), listed in the
-# order photos should be taken / placed (top to bottom).
-# --------------------------------------------------------------------------
-FRAMES = {
-    "frame3": {
-        "label": "하트 & 클로버 (블루)",
-        "path": "assets/frame3.jpg",
-        "slots": [
-            (373, 74, 674, 436),
-            (38, 250, 339, 612),
-            (373, 451, 674, 813),
-            (38, 627, 339, 988),
-        ],
-    },
-    "frame2": {
-        "label": "필름 스트립 (화이트)",
-        "path": "assets/frame2.jpg",
-        "slots": [
-            (167, 79, 565, 378),
-            (167, 416, 565, 715),
-            (167, 754, 565, 1052),
-            (167, 1091, 565, 1389),
-        ],
-    },
-    "frame1": {
-        "label": "필름 스트립 (블랙)",
-        "path": "assets/frame1.jpg",
-        "slots": [
-            (246, 43, 514, 227),
-            (246, 238, 514, 422),
-            (246, 434, 514, 629),
-            (246, 641, 514, 818),
-        ],
-    },
-}
-
-if "step" not in st.session_state:
-    st.session_state.step = "select"
-if "frame_key" not in st.session_state:
-    st.session_state.frame_key = None
-if "result_image" not in st.session_state:
-    st.session_state.result_image = None
-
-
-def slot_aspect_ratio(frame_key: str) -> float:
-    x0, y0, x1, y1 = FRAMES[frame_key]["slots"][0]
-    return (x1 - x0) / (y1 - y0)
-
-
-def compose_final_image(frame_key: str, photo_data_urls):
-    frame_info = FRAMES[frame_key]
-    frame_img = Image.open(frame_info["path"]).convert("RGB")
-    result = frame_img.copy()
-
-    for (x0, y0, x1, y1), data_url in zip(frame_info["slots"], photo_data_urls):
-        header, encoded = data_url.split(",", 1)
-        photo_bytes = base64.b64decode(encoded)
-        photo = Image.open(io.BytesIO(photo_bytes)).convert("RGB")
-
-        target_w, target_h = x1 - x0, y1 - y0
-        fitted = ImageOps.fit(photo, (target_w, target_h), Image.LANCZOS)
-        result.paste(fitted, (x0, y0))
-
-    return result
-
-
-def reset_to_start():
-    st.session_state.step = "select"
-    st.session_state.frame_key = None
-    st.session_state.result_image = None
-
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # --------------------------------------------------------------------------
-# STEP 1: select a frame
+# Camera widget: a Streamlit custom component written in plain HTML/JS.
+# It is embedded here as a string (instead of a separate frontend folder)
+# so the whole app is a single file with no risk of missing sub-files when
+# deploying to Streamlit Community Cloud.
 # --------------------------------------------------------------------------
-def render_select_step():
-    st.title("📸 포토부스")
-    st.write("먼저 마음에 드는 프레임을 선택해주세요.")
+_CAMERA_HTML = r"""<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8" />
+<style>
+  html, body {
+    margin: 0; padding: 0;
+    background: #000;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Malgun Gothic", sans-serif;
+    overflow: hidden;
+  }
+  #stage {
+    position: relative;
+    width: 100%;
+    height: var(--stage-height, 700px);
+    background: #111;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+  }
+  video {
+    position: absolute;
+    top: 50%; left: 50%;
+    min-width: 100%; min-height: 100%;
+    width: auto; height: auto;
+    transform: translate(-50%, -50%) scaleX(-1); /* mirror like a mirror */
+    object-fit: cover;
+  }
+  /* dark overlay with a transparent "window" cut out in the middle,
+     so the camera is only clearly visible through the frame's photo slot */
+  #frameWindow {
+    position: relative;
+    z-index: 5;
+    box-shadow: 0 0 0 9999px rgba(0,0,0,0.62);
+    border: 3px solid rgba(255,255,255,0.9);
+    border-radius: 10px;
+  }
+  #countdown {
+    position: absolute;
+    z-index: 20;
+    top: 0; left: 0; right: 0; bottom: 0;
+    display: none;
+    align-items: center;
+    justify-content: center;
+    font-size: 140px;
+    font-weight: 800;
+    color: #fff;
+    text-shadow: 0 4px 24px rgba(0,0,0,0.6);
+  }
+  #flash {
+    position: absolute;
+    z-index: 30;
+    top:0; left:0; right:0; bottom:0;
+    background: #fff;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.12s ease-out;
+  }
+  #topbar {
+    position: absolute;
+    top: 14px; left: 0; right: 0;
+    z-index: 15;
+    display: flex;
+    justify-content: center;
+  }
+  #counter {
+    background: rgba(0,0,0,0.55);
+    color: #fff;
+    padding: 6px 18px;
+    border-radius: 999px;
+    font-size: 15px;
+    letter-spacing: 0.5px;
+  }
+  #bottombar {
+    position: absolute;
+    bottom: 22px; left: 0; right: 0;
+    z-index: 15;
+    display: flex;
+    justify-content: center;
+    gap: 12px;
+  }
+  button.ctrl {
+    background: #fff;
+    color: #111;
+    border: none;
+    border-radius: 999px;
+    padding: 14px 34px;
+    font-size: 17px;
+    font-weight: 700;
+    cursor: pointer;
+    box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+  }
+  button.ctrl:active { transform: scale(0.97); }
+  button.secondary {
+    background: rgba(255,255,255,0.15);
+    color: #fff;
+    border: 1px solid rgba(255,255,255,0.6);
+  }
+  #status {
+    position: absolute;
+    z-index: 15;
+    bottom: 90px;
+    left: 0; right: 0;
+    text-align: center;
+    color: #fff;
+    font-size: 14px;
+    opacity: 0.85;
+  }
+</style>
+</head>
+<body>
 
-    cols = st.columns(3)
-    for col, key in zip(cols, FRAMES.keys()):
-        info = FRAMES[key]
-        with col:
-            st.image(info["path"], use_container_width=True)
-            selected = st.session_state.frame_key == key
-            btn_label = "✅ 선택됨" if selected else "이 프레임 선택"
-            if st.button(btn_label, key=f"choose_{key}", use_container_width=True):
-                st.session_state.frame_key = key
-                st.rerun()
-            st.caption(info["label"])
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="frameWindow"></div>
+  <div id="countdown"></div>
+  <div id="flash"></div>
+  <div id="topbar"><div id="counter">촬영 대기 중</div></div>
+  <div id="status"></div>
+  <div id="bottombar">
+    <button class="ctrl secondary" id="fullscreenBtn" type="button">전체화면</button>
+    <button class="ctrl" id="startBtn" type="button">촬영 시작</button>
+  </div>
+</div>
 
-    st.divider()
-    disabled = st.session_state.frame_key is None
-    if st.button("🎬 촬영 시작하기", type="primary", use_container_width=True, disabled=disabled):
-        st.session_state.step = "shoot"
-        st.rerun()
+<canvas id="canvas" style="display:none;"></canvas>
 
-    if disabled:
-        st.info("프레임을 하나 선택하면 시작 버튼이 활성화됩니다.")
+<script>
+  const SET_COMPONENT_VALUE = "streamlit:setComponentValue";
+  const RENDER = "streamlit:render";
+  const COMPONENT_READY = "streamlit:componentReady";
+  const SET_FRAME_HEIGHT = "streamlit:setFrameHeight";
 
+  function _sendMessage(type, data) {
+    const outboundData = Object.assign({ isStreamlitMessage: true, type: type }, data);
+    window.parent.postMessage(outboundData, "*");
+  }
 
-# --------------------------------------------------------------------------
-# STEP 2: shoot 4 photos via the camera component
-# --------------------------------------------------------------------------
-def render_shoot_step():
-    frame_key = st.session_state.frame_key
-    st.title("📷 촬영하기")
-    st.write("카메라 화면 가운데 창에 맞춰 포즈를 잡고 '촬영 시작'을 눌러주세요. "
-             "3-2-1 카운트다운 후 자동으로 4번 촬영됩니다.")
+  function setFrameHeight(height) {
+    _sendMessage(SET_FRAME_HEIGHT, { height: height });
+  }
 
-    aspect = slot_aspect_ratio(frame_key)
-    result = camera_capture(aspect_ratio=aspect, shots=4, height=680, key=f"cam_{frame_key}")
+  function notifyHost(value) {
+    _sendMessage(SET_COMPONENT_VALUE, { value: value, dataType: "json" });
+  }
 
-    if result and result.get("photos") and len(result["photos"]) == 4:
-        final_img = compose_final_image(frame_key, result["photos"])
-        st.session_state.result_image = final_img
-        st.session_state.step = "result"
-        st.rerun()
+  let aspectRatio = 1.0;
+  let totalShots = 4;
+  let stageHeight = 700;
+  let videoStream = null;
+  let capturedPhotos = [];
+  let sequenceRunning = false;
+  let initialized = false;
 
-    st.divider()
-    if st.button("⬅️ 프레임 다시 선택하기"):
-        reset_to_start()
-        st.rerun()
+  function onRender(args) {
+    if (!args) return;
+    aspectRatio = args.aspectRatio || 1.0;
+    totalShots = args.shots || 4;
+    stageHeight = args.height || 700;
+    document.getElementById("stage").style.setProperty("--stage-height", stageHeight + "px");
+    layoutWindow();
+    if (!initialized) {
+      initialized = true;
+      initCamera();
+    }
+  }
 
-
-# --------------------------------------------------------------------------
-# STEP 3: show result, allow download or retake
-# --------------------------------------------------------------------------
-def render_result_step():
-    st.title("🎉 완성!")
-    st.write("촬영한 사진이 프레임에 맞춰 완성되었습니다.")
-
-    final_img = st.session_state.result_image
-    st.image(final_img, use_container_width=True)
-
-    buf = io.BytesIO()
-    final_img.save(buf, format="PNG")
-    buf.seek(0)
-    filename = f"photobooth_{datetime.now().strftime('%Y%m%d_%H%M%S')}.png"
-
-    col1, col2 = st.columns(2)
-    with col1:
-        st.download_button(
-            "💾 저장하기 (PNG)",
-            data=buf,
-            file_name=filename,
-            mime="image/png",
-            type="primary",
-            use_container_width=True,
-        )
-    with col2:
-        if st.button("🔄 다시 하기", use_container_width=True):
-            reset_to_start()
-            st.rerun()
-
-
-# --------------------------------------------------------------------------
-# router
-# --------------------------------------------------------------------------
-if st.session_state.step == "select":
-    render_select_step()
-elif st.session_state.step == "shoot":
-    render_shoot_step()
-elif st.session_state.step == "result":
-    render_result_step()
+  window.addEventListener("message", (event) => {
+    if (event.data.type === RENDER) {
+      onRender(event.data.args);
+    }
+  });
