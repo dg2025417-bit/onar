@@ -204,6 +204,26 @@ FRAMES = {
     },
 }
 
+
+def _check_assets():
+    missing = []
+    for info in FRAMES.values():
+        if not os.path.isfile(info["path"]):
+            missing.append(info["path"])
+    return missing
+
+
+_missing_assets = _check_assets()
+if _missing_assets:
+    st.error(
+        "다음 프레임 이미지 파일을 찾을 수 없습니다. GitHub 저장소에 `assets` 폴더와 "
+        "이미지 3장이 `main.py`와 같은 위치에 올바른 이름으로 업로드되어 있는지 확인해주세요:\n\n"
+        + "\n".join(f"- `{p}`" for p in _missing_assets)
+        + "\n\n(저장소 구조가 `main.py` / `assets/frame1.jpg` / `assets/frame2.jpg` / "
+        "`assets/frame3.jpg` 형태여야 합니다.)"
+    )
+    st.stop()
+
 if "step" not in st.session_state:
     st.session_state.step = "select"
 if "frame_key" not in st.session_state:
